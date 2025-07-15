@@ -200,7 +200,7 @@ impl Index {
             let blockhash: BlockHash = deserialize(&row).expect("invalid block_hash");
             start = self.chain.get_block_height(&blockhash).expect("Can't find block_hash") + 1;
         } else {
-            start = 70_000;
+            start = 70_000; //FIXME: Starting height?
         }
         let end = if start + 2000 < self.chain.height() {
             start + 2000
@@ -355,13 +355,17 @@ fn index_single_block(
     height: usize,
     batch: &mut WriteBatch,
 ) {
-    struct IndexBlockVisitor<'a> {
+        struct IndexBlockVisitor<'a> {
         batch: &'a mut WriteBatch,
         height: usize,
+        current_tx: Option<bsl::Transaction<'a>>, // Store the current transaction
+        input_index: usize, // Track input index for witness lookup
     }
 
     impl<'a> Visitor for IndexBlockVisitor<'a> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
+            self.current_tx = Some(tx.clone());
+            self.input_index = 0;
             let txid = bsl_txid(tx);
             self.batch
                 .txid_rows
@@ -385,7 +389,29 @@ fn index_single_block(
             if !prevout.is_null() {
                 let row = SpendingPrefixRow::row(prevout, self.height);
                 self.batch.spending_rows.push(row.to_db_row());
+
+                // Silent Payments: Extract and store pubkey if present
+                let txinwitness = self.current_tx
+                    .as_ref()
+                    .and_then(|tx| tx.witness(self.input_index))
+                    .map(|w| w.stack().iter().map(|v| v.to_vec()).collect())
+                    .unwrap_or_default();
+
+                if let Ok(Some(pubkey_from_input)) = crate::sp::get_pubkey_from_input(&crate::sp::VinData {
+                    script_sig: tx_in.script_sig().to_vec(),
+                    txinwitness,
+                    script_pub_key: vec![], // You may need to look up the prevout script here if needed
+                }) {
+                    let pubkey_bytes = match pubkey_from_input {
+                        crate::sp::PubKeyFromInput::XOnlyPublicKey(xpk) => xpk.serialize().to_vec(),
+                        crate::sp::PubKeyFromInput::PublicKey(pk) => pk.to_bytes().to_vec(),
+                    };
+                    let row = crate::types::InputPubkeyRow::row(prevout, &pubkey_bytes);
+                    self.batch.input_pubkey_rows.push(row.to_db_row());
+                }
+                // ---------------------------------------------------
             }
+            self.input_index += 1; // Increment input index for next call
             ControlFlow::Continue(())
         }
 
@@ -399,7 +425,12 @@ fn index_single_block(
         }
     }
 
-    let mut index_block = IndexBlockVisitor { batch, height };
+    let mut index_block = IndexBlockVisitor {
+        batch,
+        height,
+        current_tx: None,
+        input_index: 0,
+    };
     bsl::Block::visit(&block, &mut index_block).expect("core returned invalid block");
 
     let len = block_hash

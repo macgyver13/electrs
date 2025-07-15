@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use bitcoin::{
     consensus::{deserialize, encode::serialize_hex},
     hashes::hex::FromHex,
+    hex::DisplayHex,
     BlockHash, Txid,
 };
 use crossbeam_channel::Receiver;
@@ -377,17 +378,21 @@ impl Rpc {
                 .map(|(blockhash, _tx)| blockhash);
             return self.daemon.get_transaction_info(&txid, blockhash);
         }
-        if let Some(tx) = self.cache.get_tx(&txid, serialize_hex) {
-            return Ok(json!(tx));
+        // if the scripthash was subscribed, tx should be cached
+        if let Some(tx_hex) = self
+            .cache
+            .get_tx(&txid, |tx_bytes| tx_bytes.to_lower_hex_string())
+        {
+            return Ok(json!(tx_hex));
         }
         debug!("tx cache miss: txid={}", txid);
-        // use internal index to load confirmed transaction without an RPC
-        if let Some(tx) = self
+        // use internal index to load confirmed transaction
+        if let Some(tx_hex) = self
             .tracker
             .lookup_transaction(&self.daemon, txid)?
-            .map(|(_blockhash, tx)| tx)
+            .map(|(_blockhash, tx)| tx.to_lower_hex_string())
         {
-            return Ok(json!(serialize_hex(&tx)));
+            return Ok(json!(tx_hex));
         }
         // load unconfirmed transaction via RPC
         Ok(json!(self.daemon.get_transaction_hex(&txid, None)?))
@@ -405,9 +410,9 @@ impl Rpc {
             Some(position) => {
                 let proof = Proof::create(&txids, position);
                 Ok(json!({
-                "block_height": height,
-                "pos": proof.position(),
-                "merkle": proof.to_hex(),
+                    "block_height": height,
+                    "pos": proof.position(),
+                    "merkle": proof.to_hex(),
                 }))
             }
         }
@@ -778,7 +783,7 @@ fn check_between(version_str: &str, min_str: &str, max_str: &str) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{check_between, parse_version, Version};
+    use super::*;
 
     #[test]
     fn test_version() {
@@ -800,5 +805,20 @@ mod tests {
         assert!(check_between("1.4", "1.3", "1.3").is_err());
         assert!(check_between("1.4", "1.4.1", "1.5").is_err());
         assert!(check_between("1.4", "1", "1").is_err());
+    }
+
+    #[test]
+    fn test_requests() {
+        assert!(matches!(
+            parse_requests("foo"),
+            Err(StandardError::ParseError)
+        ));
+        assert!(matches!(
+            parse_requests(r"{}"),
+            Err(StandardError::InvalidRequest)
+        ));
+        assert!(parse_requests(r#"{"id":1,"method":"name","params":[]}"#).is_ok());
+        assert!(parse_requests(r#"{"id":1,"method":"name","params":[],"unrelated":42}"#).is_ok());
+        assert!(parse_requests(r#" { "id" : 1 , "method" : "name" , "params" : [ ] } "#).is_ok());
     }
 }

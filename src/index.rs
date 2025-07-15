@@ -7,6 +7,7 @@ use bitcoin::{BlockHash, OutPoint, Txid, XOnlyPublicKey};
 use bitcoin_slices::{bsl, Visit, Visitor};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::thread;
 
 use crate::{
     chain::{Chain, NewHeader},
@@ -272,27 +273,59 @@ impl Index {
                 return Ok(true); // no more blocks to index (done for now)
             }
         }
-        for chunk in new_headers.chunks(self.batch_size) {
-            exit_flag.poll().with_context(|| {
-                format!(
-                    "indexing interrupted at height: {}",
-                    chunk.first().unwrap().height()
-                )
-            })?;
-            self.sync_blocks(daemon, chunk, false)?;
-        }
+
+        thread::scope(|scope| -> Result<()> {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+
+            let chunks = new_headers.chunks(self.batch_size);
+            let index = &self; // to be moved into reader thread
+            let reader = thread::Builder::new()
+                .name("index_build".into())
+                .spawn_scoped(scope, move || -> Result<()> {
+                    for chunk in chunks {
+                        exit_flag.poll().with_context(|| {
+                            format!(
+                                "indexing interrupted at height: {}",
+                                chunk.first().unwrap().height()
+                            )
+                        })?;
+                        let batch = index.index_blocks(daemon, chunk)?;
+                        tx.send(batch).context("writer disconnected")?;
+                    }
+                    Ok(()) // `tx` is dropped, to stop the iteration on `rx`
+                })
+                .expect("spawn failed");
+
+            let index = &self; // to be moved into writer thread
+            let writer = thread::Builder::new()
+                .name("index_write".into())
+                .spawn_scoped(scope, move || {
+                    let stats = &index.stats;
+                    for mut batch in rx {
+                        stats.observe_duration("sort", || batch.sort()); // pre-sort to optimize DB writes
+                        stats.observe_batch(&batch);
+                        stats.observe_duration("write", || index.store.write(&batch));
+                        stats.observe_db(&index.store);
+                    }
+                })
+                .expect("spawn failed");
+
+            reader.join().expect("reader thread panic")?;
+            writer.join().expect("writer thread panic");
+            Ok(())
+        })?;
         self.chain.update(new_headers);
         self.stats.observe_chain(&self.chain);
         self.flush_needed = true;
         Ok(false) // sync is not done
     }
 
-    fn sync_blocks(&mut self, daemon: &Daemon, chunk: &[NewHeader], sp: bool) -> Result<()> {
+    fn index_blocks(&self, daemon: &Daemon, chunk: &[NewHeader]) -> Result<WriteBatch> {
         let blockhashes: Vec<BlockHash> = chunk.iter().map(|h| h.hash()).collect();
         let mut heights = chunk.iter().map(|h| h.height());
 
         let mut batch = WriteBatch::default();
-        if !sp {
+        // if !sp {
             let scan_block = |blockhash, block| {
                 let height = heights.next().expect("unexpected block");
                 self.stats.observe_duration("block", || {
@@ -302,23 +335,23 @@ impl Index {
             };
 
             daemon.for_blocks(blockhashes, scan_block)?;
-        } else {
-            let scan_block_for_sp = |blockhash, block| {
-                let height = heights.next().expect("unexpected block");
-                self.stats.observe_duration("block_sp", || {
-                    scan_single_block_for_silent_payments(
-                        self,
-                        daemon,
-                        blockhash,
-                        block,
-                        &mut batch,
-                    );
-                });
-                self.stats.height.set("sp", height as f64);
-            };
+        // } else {
+        //     let scan_block_for_sp = |blockhash, block| {
+        //         let height = heights.next().expect("unexpected block");
+        //         self.stats.observe_duration("block_sp", || {
+        //             scan_single_block_for_silent_payments(
+        //                 self,
+        //                 daemon,
+        //                 blockhash,
+        //                 block,
+        //                 &mut batch,
+        //             );
+        //         });
+        //         self.stats.height.set("sp", height as f64);
+        //     };
 
-            daemon.for_blocks(blockhashes, scan_block_for_sp)?;
-        }
+        //     daemon.for_blocks(blockhashes, scan_block_for_sp)?;
+        // }
 
         let heights: Vec<_> = heights.collect();
         assert!(
@@ -326,18 +359,7 @@ impl Index {
             "some blocks were not indexed: {:?}",
             heights
         );
-        batch.sort();
-        self.stats.observe_batch(&batch);
-        if !sp {
-            self.stats
-                .observe_duration("write", || self.store.write(&batch));
-        } else {
-            self.stats
-                .observe_duration("write_sp", || self.store.write_sp(&batch));
-        }
-        
-        self.stats.observe_db(&self.store);
-        Ok(())
+        Ok(batch)
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -362,7 +384,7 @@ fn index_single_block(
         input_index: usize, // Track input index for witness lookup
     }
 
-    impl<'a> Visitor for IndexBlockVisitor<'a> {
+    impl Visitor for IndexBlockVisitor<'_> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
             self.current_tx = Some(tx.clone());
             self.input_index = 0;

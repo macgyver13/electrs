@@ -16,6 +16,7 @@ use crate::{
     signals::ExitFlag,
     types::{
         bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow,
+        InputPubkeyRow,
         TxidRow,
     },
 };
@@ -358,11 +359,13 @@ fn index_single_block(
     struct IndexBlockVisitor<'a> {
         batch: &'a mut WriteBatch,
         height: usize,
+        current_txid: Option<Txid>,
     }
 
     impl<'a> Visitor for IndexBlockVisitor<'a> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
             let txid = bsl_txid(tx);
+            self.current_txid = Some(txid);
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
@@ -375,6 +378,21 @@ fn index_single_block(
             if !script.is_op_return() {
                 let row = ScriptHashRow::row(ScriptHash::new(script), self.height);
                 self.batch.funding_rows.push(row.to_db_row());
+                // FIXME: only do this if silent payments are enabled
+                // Index the pubkey from the script and store it in the database with outpoint
+                if let Some(txid) = self.current_txid {
+                    let outpoint = OutPoint {
+                        txid,
+                        vout: _vout as u32,
+                    };
+                    let input_pubkey_row = InputPubkeyRow::row(outpoint, tx_out.script_pubkey());
+                    self.batch.input_pubkey_rows.push((
+                        input_pubkey_row.to_db_key().to_vec(),
+                        input_pubkey_row.to_db_value().to_vec(),
+                    ));
+                } else {
+                    warn!("Transaction ID is not set for output indexing");
+                }
             }
             ControlFlow::Continue(())
         }
@@ -399,7 +417,7 @@ fn index_single_block(
         }
     }
 
-    let mut index_block = IndexBlockVisitor { batch, height };
+    let mut index_block = IndexBlockVisitor { batch, height, current_txid: None };
     bsl::Block::visit(&block, &mut index_block).expect("core returned invalid block");
 
     let len = block_hash
@@ -462,30 +480,54 @@ fn scan_single_block_for_silent_payments(
             let mut outpoints: Vec<(Txid, u32)> = Vec::with_capacity(parsed_tx.input.len());
             for i in parsed_tx.input.iter() {
                 outpoints.push((i.previous_output.txid, i.previous_output.vout));
-                let prev_tx: bitcoin::Transaction = self
-                    .daemon
-                    .get_transaction(&i.previous_output.txid, None)
-                    .expect("Spending non existent UTXO");
-                let index: usize = i
-                    .previous_output
-                    .vout
-                    .try_into()
-                    .expect("Unexpectedly high vout");
-                let prevout: &bitcoin::TxOut = prev_tx
-                    .output
-                    .get(index)
-                    .expect("Spending a non existent UTXO");
-                match crate::sp::get_pubkey_from_input(&crate::sp::VinData {
-                    script_sig: i.script_sig.to_bytes(),
-                    txinwitness: i.witness.to_vec(),
-                    script_pub_key: prevout.script_pubkey.to_bytes(),
-                }) {
-                    Ok(Some(pubkey_from_input)) => match pubkey_from_input {
-                        crate::sp::PubKeyFromInput::XOnlyPublicKey(xonly_pubkey) => xonly_pubkeys.push(xonly_pubkey),
-                        crate::sp::PubKeyFromInput::PublicKey(pubkey) => pubkeys.push(pubkey), 
-                    },
+                // Try to get pubkey bytes from DB first
+                let outpoint = bitcoin::OutPoint {
+                    txid: i.previous_output.txid,
+                    vout: i.previous_output.vout,
+                };
+                let pubkey_bytes_opt = self.index.store.get_input_pubkey(&outpoint);
+
+                let pubkey_result = if let Some(pubkey_bytes) = pubkey_bytes_opt {
+                    info!(
+                        "Found input pubkey in db for {}:{}, using it {:?}",
+                        i.previous_output.txid, i.previous_output.vout, hex::encode(&pubkey_bytes)
+                    );
+                    crate::sp::get_pubkey_from_input(&crate::sp::VinData {
+                        script_sig: i.script_sig.to_bytes(),
+                        txinwitness: i.witness.to_vec(),
+                        script_pub_key: pubkey_bytes,
+                    })
+                } else {
+                    warn!(
+                        "unable to find input pubkey in db for {}:{}, falling back to rpc",
+                        i.previous_output.txid, i.previous_output.vout
+                    );
+                    // Fallback: fetch previous tx from rpc and extract pubkey
+                    let prev_tx: bitcoin::Transaction = self
+                        .daemon
+                        .get_transaction(&i.previous_output.txid, None)
+                        .expect("Spending non existent UTXO");
+                    let index: usize = i
+                        .previous_output
+                        .vout
+                        .try_into()
+                        .expect("Unexpectedly high vout");
+                    let prevout: &bitcoin::TxOut = prev_tx
+                        .output
+                        .get(index)
+                        .expect("Spending a non existent UTXO");
+                    crate::sp::get_pubkey_from_input(&crate::sp::VinData {
+                        script_sig: i.script_sig.to_bytes(),
+                        txinwitness: i.witness.to_vec(),
+                        script_pub_key: prevout.script_pubkey.to_bytes(),
+                    })
+                };
+
+                match pubkey_result {
+                    Ok(Some(crate::sp::PubKeyFromInput::XOnlyPublicKey(xonly_pubkey))) => xonly_pubkeys.push(xonly_pubkey),
+                    Ok(Some(crate::sp::PubKeyFromInput::PublicKey(pubkey))) => pubkeys.push(pubkey),
                     Ok(None) => (),
-                    Err(_) => panic!("Scanning for public keys failed for tx: {}", txid),
+                    Err(msg) => warn!("Scanning for public keys failed for tx: {}: {}", txid, msg),
                 }
             }
             let pubkeys_ref: Vec<&PublicKey> = pubkeys.iter().collect();

@@ -134,8 +134,11 @@ pub fn get_pubkey_from_input(vin: &VinData) -> Result<Option<PubKeyFromInput>, E
 
                 // Check for script path
                 let stack_size = vin.txinwitness.len();
-                if stack_size > annex && vin.txinwitness[stack_size - annex - 1][1..33] == NUMS_H {
-                    return Ok(None);
+                if stack_size > annex {
+                    let witness_elem = &vin.txinwitness[stack_size - annex - 1];
+                    if witness_elem.len() >= 33 && witness_elem[1..33] == NUMS_H {
+                        return Ok(None);
+                    }
                 }
 
                 // Return the pubkey from the script pubkey

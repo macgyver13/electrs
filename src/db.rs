@@ -12,6 +12,7 @@ pub(crate) struct WriteBatch {
     pub(crate) sp_tip_row: [u8; 32],
     pub(crate) header_rows: Vec<SerializedHeaderRow>,
     pub(crate) funding_rows: Vec<SerializedHashPrefixRow>,
+    pub(crate) input_pubkey_rows: Vec<(Vec<u8>, Vec<u8>)>,
     pub(crate) spending_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) txid_rows: Vec<SerializedHashPrefixRow>,
     pub(crate) tweak_rows: Vec<Vec<u8>>,
@@ -21,6 +22,7 @@ impl WriteBatch {
     pub(crate) fn sort(&mut self) {
         self.header_rows.sort_unstable();
         self.funding_rows.sort_unstable();
+        self.input_pubkey_rows.sort_unstable();
         self.spending_rows.sort_unstable();
         self.txid_rows.sort_unstable();
         self.tweak_rows.sort_unstable();
@@ -39,8 +41,9 @@ const TXID_CF: &str = "txid";
 const FUNDING_CF: &str = "funding";
 const SPENDING_CF: &str = "spending";
 const TWEAK_CF: &str = "tweak";
+const INPUT_PUBKEY_CF: &str = "input_pubkey";
 
-const COLUMN_FAMILIES: &[&str] = &[CONFIG_CF, HEADERS_CF, TXID_CF, FUNDING_CF, SPENDING_CF, TWEAK_CF];
+const COLUMN_FAMILIES: &[&str] = &[CONFIG_CF, HEADERS_CF, TXID_CF, FUNDING_CF, SPENDING_CF, TWEAK_CF, INPUT_PUBKEY_CF];
 
 const CONFIG_KEY: &str = "C";
 const TIP_KEY: &[u8] = b"T";
@@ -227,6 +230,10 @@ impl DBStore {
         self.db.cf_handle(TWEAK_CF).expect("missing TWEAK_CF")
     }
 
+    fn input_pubkey_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle(INPUT_PUBKEY_CF).expect("missing INPUT_PUBKEY_CF")
+    }
+
     pub(crate) fn iter_funding(
         &self,
         prefix: HashPrefix,
@@ -283,6 +290,15 @@ impl DBStore {
             .collect()
     }
 
+    pub(crate) fn get_input_pubkey(&self, outpoint: &bitcoin::OutPoint) -> Option<Vec<u8>> {
+        let mut key = [0u8; 36];
+        key[..32].copy_from_slice(outpoint.txid.as_ref());
+        key[32..].copy_from_slice(&outpoint.vout.to_le_bytes());
+        self.db
+            .get_cf(self.input_pubkey_cf(), &key)
+            .expect("get_input_pubkey failed")
+    }
+
     pub(crate) fn get_tip(&self) -> Option<Vec<u8>> {
         self.db
             .get_cf(self.headers_cf(), TIP_KEY)
@@ -308,6 +324,9 @@ impl DBStore {
         }
         for key in &batch.header_rows {
             db_batch.put_cf(self.headers_cf(), key, b"");
+        }
+        for (key, value) in &batch.input_pubkey_rows {
+            db_batch.put_cf(self.input_pubkey_cf(), key, value);
         }
         db_batch.put_cf(self.headers_cf(), TIP_KEY, batch.tip_row);
 

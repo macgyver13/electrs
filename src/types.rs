@@ -115,6 +115,43 @@ hash_newtype! {
 }
 
 // ***************************************************************************
+pub(crate) struct InputPubkeyRow {
+    pub prevout: bitcoin::OutPoint,
+    pub pubkey_bytes: Vec<u8>,
+}
+
+impl InputPubkeyRow {
+    pub(crate) fn row(prevout: bitcoin::OutPoint, pubkey_bytes: &[u8]) -> Self {
+        InputPubkeyRow {
+            prevout,
+            pubkey_bytes: pubkey_bytes.to_vec(),
+        }
+    }
+
+    /// Serialize OutPoint as a 36-byte key: [txid (32 bytes) | vout (4 bytes LE)]
+    pub(crate) fn to_db_key(&self) -> [u8; 36] {
+        let mut key = [0u8; 36];
+        key[..32].copy_from_slice(self.prevout.txid.as_ref());
+        key[32..].copy_from_slice(&self.prevout.vout.to_le_bytes());
+        key
+    }
+
+    /// The value is just the pubkey bytes
+    pub(crate) fn to_db_value(&self) -> &[u8] {
+        &self.pubkey_bytes
+    }
+    // FIXME: remove or uncomment this function
+    // pub(crate) fn from_db(key: &[u8; 36], value: &[u8]) -> Self {
+    //     let txid = bitcoin::Txid::from_slice(&key[..32]).expect("invalid txid");
+    //     let vout = u32::from_le_bytes(key[32..36].try_into().unwrap());
+    //     InputPubkeyRow {
+    //         prevout: bitcoin::OutPoint { txid, vout },
+    //         pubkey_bytes: value.to_vec(),
+    //     }
+    // }
+}
+
+// ***************************************************************************
 
 fn spending_prefix(prev: OutPoint) -> HashPrefix {
     let txid_prefix = HashPrefix::try_from(&prev.txid[..HASH_PREFIX_LEN]).unwrap();

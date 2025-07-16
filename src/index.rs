@@ -170,22 +170,18 @@ impl Index {
             .filter_map(move |height| self.chain.get_block_hash(height))
     }
 
-    pub(crate) fn get_tweaks(&self, height: u64) -> impl Iterator<Item = (u64, Vec<String>)> + '_ {
+    pub(crate) fn get_tweaks(&self, height: u64) -> impl Iterator<Item = String> + '_ {
         self.store
             .read_tweaks(height)
             .into_iter()
-            .filter_map(move |(block_height, tweaks)| {
+            .flat_map(move |(block_height, tweaks)| {
                 assert!(tweaks.len() % 33 == 0 && tweaks.len() > 0);
                 assert!(block_height.len() == 8);
 
-                let tweak_row_block_height =
-                    u64::from_be_bytes(block_height[..].try_into().unwrap());
-                let pks = tweaks
+                tweaks
                     .chunks(33)
                     .map(|x| format!("{}", x.as_hex()))
-                    .collect();
-
-                Some((tweak_row_block_height, pks))
+                    .collect::<Vec<String>>()
             })
     }
 
@@ -488,9 +484,9 @@ fn scan_single_block_for_silent_payments(
                 let pubkey_bytes_opt = self.index.store.get_input_pubkey(&outpoint);
 
                 let pubkey_result = if let Some(pubkey_bytes) = pubkey_bytes_opt {
-                    info!(
-                        "Found input pubkey in db for {}:{}, using it {:?}",
-                        i.previous_output.txid, i.previous_output.vout, hex::encode(&pubkey_bytes)
+                    debug!(
+                        "Found input pubkey in db for {}:{}, using it {}",
+                        i.previous_output.txid, i.previous_output.vout, pubkey_bytes.as_hex()
                     );
                     crate::sp::get_pubkey_from_input(&crate::sp::VinData {
                         script_sig: i.script_sig.to_bytes(),
@@ -498,7 +494,7 @@ fn scan_single_block_for_silent_payments(
                         script_pub_key: pubkey_bytes,
                     })
                 } else {
-                    warn!(
+                    debug!(
                         "unable to find input pubkey in db for {}:{}, falling back to rpc",
                         i.previous_output.txid, i.previous_output.vout
                     );
@@ -527,7 +523,7 @@ fn scan_single_block_for_silent_payments(
                     Ok(Some(crate::sp::PubKeyFromInput::XOnlyPublicKey(xonly_pubkey))) => xonly_pubkeys.push(xonly_pubkey),
                     Ok(Some(crate::sp::PubKeyFromInput::PublicKey(pubkey))) => pubkeys.push(pubkey),
                     Ok(None) => (),
-                    Err(msg) => warn!("Scanning for public keys failed for tx: {}: {}", txid, msg),
+                    Err(msg) => debug!("Scanning for public keys failed for tx: {}: {}", txid, msg),
                 }
             }
             let pubkeys_ref: Vec<&PublicKey> = pubkeys.iter().collect();

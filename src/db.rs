@@ -283,6 +283,7 @@ impl DBStore {
     pub(crate) fn read_tweaks(&self, height: u64) -> Vec<(Box<[u8]>, Box<[u8]>)> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_iterate_lower_bound(height.to_be_bytes());
+        opts.set_iterate_upper_bound((height+1).to_be_bytes());
         opts.fill_cache(false);
         self.db
             .iterator_cf_opt(self.tweak_cf(), opts, rocksdb::IteratorMode::Start)

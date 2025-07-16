@@ -387,7 +387,7 @@ fn index_single_block(
                         input_pubkey_row.to_db_value().to_vec(),
                     ));
                 } else {
-                    warn!("Transaction ID is not set for output indexing");
+                    debug!("visit_tx_out::current_txid is not set for output indexing");
                 }
             }
             ControlFlow::Continue(())
